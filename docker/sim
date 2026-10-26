@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Точка входа образа gumanoid-sim:  sim <команда> [опции].  Без команды (или "menu") — меню.
+set -uo pipefail
+
+APP=/opt/gumanoid
+
+usage() {
+    cat <<'EOF'
+Команды (на хосте: ./run.sh <команда> [опции]):
+  menu                  меню с выбором робота (по умолчанию)
+  g1   [опции]          Unitree G1, 43 ползунка (29 суставов тела + 2 кисти Dex3 по 7)
+  h2   [опции]          Unitree H2, 31 ползунок
+         опции g1/h2:   (нет)          подвешен: таз закреплён в воздухе
+                        --band         стоит на полу на подвеске; снять: правая панель -> Equality -> band
+                        --free         стоит на полу без опоры (падает: контроллера баланса нет)
+                        --unitree-kd   штатные Kd Unitree вместо критического демпфирования
+                        --no-gravcomp  без компенсации силы тяжести (в подвесе)
+                        --save-xml F   сохранить собранную сцену в MJCF и выйти
+  robot ФАЙЛ [опции]    любой робот (URDF/MJCF) с ползунками на все суставы. ФАЙЛ — путь в out/ или models/
+                        (на хосте), или короткое имя модели Unitree: h1 h1_2 g1_23 r1 r1_a5 dex3 inspire brainco
+         опции:         (нет) подвешен | --free на полу | --band на подвеске | --kp K | --effort N | --gains F.json
+                        --info таблица ползунков | --save-xml F | --help — все опции
+  models                какие модели видит контейнер (папка models/ и встроенные)
+  zbot [опции]          Zeroth-01, 16 ползунков
+         опции:         (нет) подвешен | --free на полу | --kv K демпфирование
+                        --assets /opt/gumanoid/zeroth-01-build/sim/assets/zbot-pixel   другой вариант модели
+  walk [опции]          Zeroth-01 ходит обученной политикой, управление стрелками (--list — политики)
+  demo [имя] [опции]    Zeroth-01 проигрывает записанное движение: push_ups wave kneeing walk_0 careful_walk
+                        (--list, --no-backpack, --headless)
+  example ИМЯ [опции]   пример управления из кода: script_control (Python-скрипт), udp_bridge (по сети)
+  python ФАЙЛ.py        свой скрипт из out/ (импорт: from robot_sliders import load_robot)
+  viewer [файл.xml]     чистый MuJoCo viewer; файл — из рабочей папки (на хосте out/) или /models/...
+  test                  самопроверка без окна: физика всех моделей + кадры в ./selftest/
+  glinfo                какой OpenGL видит контейнер (GPU или программный)
+  bash                  оболочка внутри контейнера
+  help                  эта справка
+EOF
+}
+
+py() { exec python3 "$@"; }
+
+# Модели для `sim robot`: короткие имена встроенных + файлы из /models (папка models/ хоста).
+SHORT_NAMES=(h1 h1_2 g1_23 r1 r1_a5 dex3 inspire brainco)
+SHORT_DESC=("Unitree H1 с кистями Inspire" "Unitree H1-2 с кистями Inspire" "Unitree G1, 23 сустава"
+            "Unitree R1 (A7)" "Unitree R1 (A5)" "кисть Unitree Dex3 (левая)" "кисть Inspire (левая)" "кисть BrainCo (левая)")
+user_models() {
+    [[ -d /models ]] || return 0
+    find /models -maxdepth 4 -type f \( -name '*.urdf' -o -name '*.xml' -o -name '*.mjcf' \) 2>/dev/null | sort | head -80
+}
+
+list_models() {
+    echo "Встроенные (sim robot <имя>):"
+    local i
+    for i in "${!SHORT_NAMES[@]}"; do printf "  %-8s %s\n" "${SHORT_NAMES[$i]}" "${SHORT_DESC[$i]}"; done
+    echo "  g1, h2, zbot — у них свои команды с настоящими коэффициентами моторов (sim g1 и т.д.)"
+    echo "Свои (папка models/ на хосте = /models в контейнере):"
+    local files
+    mapfile -t files < <(user_models)
+    if ((${#files[@]} == 0)); then
+        echo "  (пусто) — положите URDF или MJCF вместе с мешами в models/ рядом с run.sh"
+    else
+        printf "  %s\n" "${files[@]}"
+    fi
+}
+
+models_menu() {
+    local names=() labels=() i
+    for i in "${!SHORT_NAMES[@]}"; do names+=("${SHORT_NAMES[$i]}"); labels+=("${SHORT_DESC[$i]} (${SHORT_NAMES[$i]})"); done
+    local files f
+    mapfile -t files < <(user_models)
+    for f in "${files[@]}"; do names+=("$f"); labels+=("models/${f#/models/}"); done
+    echo
+    for i in "${!labels[@]}"; do printf "  %2d) %s\n" $((i + 1)) "${labels[$i]}"; done
+    ((${#files[@]})) || echo "      (своих моделей нет: положите URDF/MJCF с мешами в папку models/ рядом с run.sh)"
+    local choice mode
+    read -rp "Модель (Enter — назад): " choice || return 0
+    [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#names[@]})) || return 0
+    read -rp "Режим: 1) подвешен  2) на полу на подвеске  3) на полу без опоры [1]: " mode || return 0
+    local opts=()
+    case "$mode" in 2) opts=(--band) ;; 3) opts=(--free) ;; esac
+    echo "+ sim robot ${names[$((choice - 1))]} ${opts[*]}   (закрыть окно — вернуться в меню)"
+    "$0" robot "${names[$((choice - 1))]}" "${opts[@]}"
+}
+
+run_menu() {
+    if [[ ! -t 0 ]]; then
+        echo "Меню нужен терминал (docker run -it). Укажите команду явно:" >&2
+        usage >&2
+        exit 2
+    fi
+    local items=(
+        "Unitree G1 — подвешен (ползунки)|g1"
+        "Unitree G1 — на полу на подвеске|g1 --band"
+        "Unitree G1 — на полу без опоры (упадёт)|g1 --free"
+        "Unitree H2 — подвешен (ползунки)|h2"
+        "Unitree H2 — на полу на подвеске|h2 --band"
+        "Unitree H2 — на полу без опоры (упадёт)|h2 --free"
+        "Zeroth-01 — подвешен (ползунки)|zbot"
+        "Zeroth-01 — на полу (ползунки)|zbot --free"
+        "Zeroth-01 — ходьба с клавиатуры|walk"
+        "Zeroth-01 — демо: отжимания|demo push_ups"
+        "Zeroth-01 — демо: взмах рукой|demo wave"
+        "Другой робот: Unitree H1, H1-2, R1, кисти или свой из models/ …|@models"
+        "Пример: G1 управляется Python-скриптом (суставы по очереди)|example script_control g1"
+        "Самопроверка (без окна)|test"
+    )
+    while true; do
+        echo
+        echo "=== gumanoid-sim: MuJoCo $(python3 -c 'import mujoco; print(mujoco.__version__)') ==="
+        local i
+        for i in "${!items[@]}"; do
+            printf "  %2d) %s\n" $((i + 1)) "${items[$i]%%|*}"
+        done
+        echo "   h) справка по командам      0) выход"
+        local choice
+        read -rp "Выбор: " choice || exit 0
+        case "$choice" in
+            0|q|exit) exit 0 ;;
+            h|help) usage; continue ;;
+        esac
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#items[@]} )); then
+            local cmd="${items[$((choice - 1))]#*|}"
+            if [[ "$cmd" == @models ]]; then models_menu; continue; fi
+            echo "+ sim $cmd   (закрыть окно — вернуться в меню)"
+            # shellcheck disable=SC2086  # команда из списка выше, разбиение по словам нужно
+            "$0" $cmd
+        else
+            echo "Нет такого пункта: $choice"
+        fi
+    done
+}
+
+cmd="${1:-menu}"
+[[ $# -gt 0 ]] && shift
+case "$cmd" in
+    menu)          run_menu ;;
+    g1)            py "$APP/g1_sliders.py" "$@" ;;
+    h2)            py "$APP/h2_sliders.py" "$@" ;;
+    robot|any)     py "$APP/robot_sliders.py" "$@" ;;
+    models)        list_models ;;
+    example|examples)
+        if [[ $# -eq 0 || ! -f "$APP/examples/$1.py" ]]; then
+            echo "Примеры: $(cd "$APP/examples" && ls -- *.py | sed 's/\.py$//' | tr '\n' ' ')"
+            echo "Запуск: sim example <имя> [опции]   (--help у каждого)"
+            [[ $# -eq 0 ]] && exit 0 || exit 2
+        fi
+        name="$1"; shift
+        py "$APP/examples/$name.py" "$@" ;;
+    zbot|zeroth)   py "$APP/zbot_sliders.py" "$@" ;;
+    walk|zbot-walk) py "$APP/zbot_walk.py" "$@" ;;
+    demo|zbot-demo) py "$APP/zbot_demo.py" "$@" ;;
+    viewer)        if [[ $# -gt 0 ]]; then py -m mujoco.viewer --mjcf="$1"; else py -m mujoco.viewer; fi ;;
+    test|selftest) py "$APP/docker/selftest.py" "$@" ;;
+    glinfo)        exec glxinfo -B ;;
+    bash|shell)    exec bash "$@" ;;
+    help|-h|--help) usage ;;
+    *)             exec "$cmd" "$@" ;;
+esac

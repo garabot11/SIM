@@ -1,0 +1,4 @@
+{
+  "_hip_joint|_thigh_joint": {"kp": 60, "kv": 2.0},
+  "_calf_joint":             {"kp": 60, "kv": 2.0}
+}

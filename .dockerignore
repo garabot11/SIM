@@ -1,0 +1,12 @@
+# В контекст сборки попадает только то, что копирует Dockerfile (модели он сам качает из GitHub).
+*
+!Dockerfile
+!zbot_sliders.py
+!zbot_walk.py
+!zbot_demo.py
+!h2_sliders.py
+!g1_sliders.py
+!robot_sliders.py
+!examples/*.py
+!docker/sim
+!docker/selftest.py

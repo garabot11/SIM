@@ -1,0 +1,17 @@
+# Окружение и кэш Python
+.venv/
+__pycache__/
+*.pyc
+MUJOCO_LOG.TXT
+
+# Модели скачиваются при сборке образа (Dockerfile); локальная копия для запуска без Docker
+zeroth-01-build/
+xr_teleoperate/
+
+# Свои роботы и результаты запусков (models/ -> /models, out/ -> /work в контейнере)
+models/
+out/*
+!out/go2_gains.json
+selftest/
+*.tar
+*.tar.gz
